@@ -42,10 +42,10 @@ def search_pubmed(search_url):
         if id_list is not None:
             return [id.text for id in id_list.findall("Id")]
         else:
-            print("No results found.")
+            logger.info("No results found.")
             return []
     else:
-        print(f"Error: Unable to fetch data (status code: {response.status_code})")
+        logger.error(f"Error: Unable to fetch data (status code: {response.status_code})")
         return []
 
 def get_pubmed_metadata(pmid):
@@ -85,15 +85,15 @@ def get_pubmed_metadata(pmid):
                 "Abstract": abstract
             }
         else:
-            print(f"No article data found for PMID: {pmid}")
+            logger.info(f"No article data found for PMID: {pmid}")
             return None
     else:
-        print(f"Error: Unable to fetch metadata (status code: {response.status_code})")
+        logger.error(f"Error: Unable to fetch metadata (status code: {response.status_code})")
         return None
 
 def download_full_text_pdf(pmid):
     """尝试下载全文 PDF 或提供文章链接"""
-    print(f"Attempting to access full text for PMID: {pmid}")
+    logger.info(f"Attempting to access full text for PMID: {pmid}")
     
     # 首先，我们需要检查这篇文章是否有PMC ID
     efetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
@@ -103,16 +103,16 @@ def download_full_text_pdf(pmid):
     response = requests.get(efetch_url, headers=headers)
     
     if response.status_code != 200:
-        print(f"Error: Unable to fetch article data (status code: {response.status_code})")
+        logger.error(f"Error: Unable to fetch article data (status code: {response.status_code})")
         return f"Error: Unable to fetch article data (status code: {response.status_code})"
     
     root = ET.fromstring(response.content)
     pmc_id = root.find(".//ArticleId[@IdType='pmc']")
     
     if pmc_id is None:
-        print(f"No PMC ID found for PMID: {pmid}")
+        logger.info(f"No PMC ID found for PMID: {pmid}")
         pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
-        print(f"You can check the article availability at: {pubmed_url}")
+        logger.info(f"You can check the article availability at: {pubmed_url}")
         return f"No PMC ID found for PMID: {pmid}" + "\n" + f"You can check the article availability at: {pubmed_url}"
     
     pmc_id = pmc_id.text
@@ -122,13 +122,13 @@ def download_full_text_pdf(pmid):
     pmc_response = requests.get(pmc_url, headers=headers)
     
     if pmc_response.status_code != 200:
-        print(f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})")
-        print(f"You can check the article availability at: {pmc_url}")
-        return f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})" + "\n" + f"You can check the article availability at: {pmc_url}"f"You can check the article availability at: {pmc_url}"
+        logger.error(f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})")
+        logger.info(f"You can check the article availability at: {pmc_url}")
+        return f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})" + "\n" + f"You can check the article availability at: {pmc_url}"
     
     if "This article is available under a" not in pmc_response.text:
-        print(f"The article doesn't seem to be fully open access.")
-        print(f"You can check the article availability at: {pmc_url}")
+        logger.info(f"The article doesn't seem to be fully open access.")
+        logger.info(f"You can check the article availability at: {pmc_url}")
         return f"The article doesn't seem to be fully open access." + "\n" + f"You can check the article availability at: {pmc_url}"
     
     # 尝试下载PDF
@@ -136,8 +136,8 @@ def download_full_text_pdf(pmid):
     pdf_response = requests.get(pdf_url, headers=headers)
     
     if pdf_response.status_code != 200:
-        print(f"Error: Unable to download PDF (status code: {pdf_response.status_code})")
-        print(f"You can try accessing the article directly at: {pmc_url}")
+        logger.error(f"Error: Unable to download PDF (status code: {pdf_response.status_code})")
+        logger.info(f"You can try accessing the article directly at: {pmc_url}")
         return f"Error: Unable to download PDF (status code: {pdf_response.status_code})" + "\n" + f"You can try accessing the article directly at: {pmc_url}"
     
     # 保存PDF文件
@@ -145,7 +145,7 @@ def download_full_text_pdf(pmid):
     with open(filename, 'wb') as f:
         f.write(pdf_response.content)
     
-    print(f"PDF for PMID {pmid} has been downloaded as {filename}")
+    logger.info(f"PDF for PMID {pmid} has been downloaded as {filename}")
     return f"PDF for PMID {pmid} has been downloaded as {filename}"
 
 def deep_paper_analysis(paper_metadata):
@@ -193,7 +193,7 @@ Ensure your analysis is thorough, objective, and based on the information provid
 def search_key_words(key_words, num_results=10):
     # 生成搜索 URL
     search_url = generate_pubmed_search_url(term=key_words, num_results=num_results)
-    print("Generated URL:", search_url)
+    logger.info(f"Generated URL: {search_url}")
 
     # 获取并解析搜索结果
     pmids = search_pubmed(search_url)
@@ -211,7 +211,7 @@ def search_advanced(term, title, author, journal, start_date, end_date, num_resu
     search_url = generate_pubmed_search_url(term=term, title=title, author=author, 
                                             journal=journal, start_date=start_date, 
                                             end_date=end_date, num_results=num_results)
-    print("Generated URL:", search_url)
+    logger.info(f"Generated URL: {search_url}")
 
     # 获取并解析搜索结果
     pmids = search_pubmed(search_url)
