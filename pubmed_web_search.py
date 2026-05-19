@@ -341,7 +341,21 @@ def get_pubmed_metadata(pmid):
                 "Abstract": abstract
             }
         else:
-            logger.info(f"No article data found for PMID: {pmid}")
+            # Enhanced diagnostics: when root parses successfully but contains no <Article>,
+            # log enough context to distinguish the common root causes:
+            #   - Empty <PubmedArticleSet/> (NCBI rate-limit / transient throttling)
+            #   - <eFetchResult><ERROR>...</ERROR></eFetchResult> (invalid PMID / API error)
+            #   - <PubmedBookArticle>/<BookDocument> (book entry, no <Article> node)
+            children = list(root)
+            err_node = root.find(".//ERROR")
+            err_msg = err_node.text if err_node is not None else None
+            book_doc = root.find(".//BookDocument")
+            logger.warning(
+                f"No <Article> in efetch response for PMID {pmid}: "
+                f"root=<{root.tag}>, children={len(children)}, "
+                f"content_len={len(response.content)}, "
+                f"is_book={book_doc is not None}, error={err_msg!r}"
+            )
             return None
     else:
         logger.error(f"Error: Unable to fetch metadata (status code: {response.status_code})")
