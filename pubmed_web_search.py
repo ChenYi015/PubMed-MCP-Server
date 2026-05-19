@@ -1,5 +1,5 @@
 import xml.etree.ElementTree as ET
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, urlunparse, urlencode, parse_qsl
 import os
 import time
 import random
@@ -7,8 +7,142 @@ import logging
 from collections import Counter
 import re
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# Common inline HTML tags found in PubMed efetch XML (italic, bold, sub/superscript, etc.)
+# Extended to cover additional formatting tags that may appear in PubMed abstract/title text.
+_INLINE_HTML_TAGS = re.compile(
+    r'</?(?:i|b|u|em|strong|sub|sup|small|big|span|font|s|strike|tt|code|var|cite|q)(?:\s[^>]*)?>',
+    re.IGNORECASE,
+)
+
+# HTML void/self-closing tags that are not valid XML and may appear in PubMed text nodes.
+_HTML_VOID_TAGS = re.compile(
+    r'<(?:br|hr|img|input|meta|link|wbr)(?:\s[^>]*)?/?>',
+    re.IGNORECASE,
+)
+
+# HTML named entities that are invalid in XML 1.0.
+# XML only defines five built-in entities: &amp; &lt; &gt; &apos; &quot;
+_HTML_NAMED_ENTITIES = [
+    ('&nbsp;',   '\u00a0'),
+    ('&ndash;',  '\u2013'),
+    ('&mdash;',  '\u2014'),
+    ('&ldquo;',  '\u201c'),
+    ('&rdquo;',  '\u201d'),
+    ('&lsquo;',  '\u2018'),
+    ('&rsquo;',  '\u2019'),
+    ('&hellip;', '\u2026'),
+    ('&bull;',   '\u2022'),
+    ('&times;',  '\u00d7'),
+    ('&alpha;',  '\u03b1'),
+    ('&beta;',   '\u03b2'),
+    ('&gamma;',  '\u03b3'),
+    ('&delta;',  '\u03b4'),
+    ('&micro;',  '\u03bc'),
+    ('&plusmn;', '\u00b1'),
+    ('&ge;',     '\u2265'),
+    ('&le;',     '\u2264'),
+]
+
+
+def _sanitize_xml(xml_bytes: bytes) -> bytes:
+    """Strip malformed inline HTML tags and replace invalid HTML entities from PubMed XML
+    to prevent ElementTree parse failures.
+    """
+    text = xml_bytes.decode('utf-8', errors='replace')
+    # Remove common inline HTML open/close tags
+    cleaned = _INLINE_HTML_TAGS.sub('', text)
+    # Remove void/self-closing HTML tags (e.g. <br>, <hr>)
+    cleaned = _HTML_VOID_TAGS.sub('', cleaned)
+    # Replace HTML named entities not valid in XML
+    for entity, replacement in _HTML_NAMED_ENTITIES:
+        cleaned = cleaned.replace(entity, replacement)
+    return cleaned.encode('utf-8')
+
+
+def _parse_xml(content: bytes):
+    """Safely parse XML with a three-level fallback strategy.
+
+    Level 1 – Direct parse: fastest path; no preprocessing for already-valid XML.
+    Level 2 – Sanitized parse: strip inline HTML tags and replace invalid HTML
+               entities, then retry with ElementTree.
+    Level 3 – BeautifulSoup fallback: last-resort lenient parse.
+               Tries ``lxml-xml`` first (preserves original tag-name casing);
+               falls back to ``html.parser`` with a warning, because html.parser
+               lowercases all tag names which can break downstream
+               ``Element.find()`` queries that rely on the original casing.
+
+    Returns the root ``Element``, or ``None`` if all attempts fail.
+    """
+    # Level 1: direct parse (handles already-valid XML without any preprocessing)
+    try:
+        return ET.fromstring(content)
+    except ET.ParseError:
+        pass
+
+    # Level 2: sanitize inline HTML tags and invalid entities, then parse
+    try:
+        sanitized = _sanitize_xml(content)
+        return ET.fromstring(sanitized)
+    except ET.ParseError as exc:
+        logger.debug("ET parse failed after sanitization: %s", exc)
+
+    # Level 3: BeautifulSoup lenient parse as last resort
+    logger.warning("Falling back to BeautifulSoup for malformed XML content")
+    # lxml-xml preserves original tag-name casing; html.parser lowercases tags.
+    for bs_parser in ('lxml-xml', 'html.parser'):
+        try:
+            soup = BeautifulSoup(content, bs_parser)
+            root = ET.fromstring(str(soup).encode('utf-8'))
+            if bs_parser == 'html.parser':
+                logger.warning(
+                    "BeautifulSoup html.parser lowercased XML tag names; "
+                    "downstream Element.find() queries may return no results"
+                )
+            return root
+        except Exception:
+            continue
+
+    logger.error("All XML parse attempts failed; returning None")
+    return None
+
+
+# NCBI E-utilities host. Credentials should only be appended to URLs hitting
+# this host to avoid leaking the API key to PMC PDF endpoints or others.
+_NCBI_EUTILS_HOST = "eutils.ncbi.nlm.nih.gov"
+
+
+def _inject_credentials(url):
+    """Inject NCBI E-utilities credentials into the URL query string.
+
+    Reads the following environment variables (each optional):
+      - PUBMED_API_KEY: NCBI API key, raises rate limit from 3/s to 10/s
+      - PUBMED_TOOL:    application name reported to NCBI (default: PubMedMCP)
+      - PUBMED_EMAIL:   contact email reported to NCBI
+
+    Only URLs targeting the NCBI E-utilities host are modified, and existing
+    query parameters with the same name are preserved (never overwritten).
+    """
+    parsed = urlparse(url)
+    if _NCBI_EUTILS_HOST not in parsed.netloc:
+        return url
+
+    api_key = os.getenv("PUBMED_API_KEY")
+    tool = os.getenv("PUBMED_TOOL", "PubMedMCP")
+    email = os.getenv("PUBMED_EMAIL")
+
+    qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if api_key and "api_key" not in qs:
+        qs["api_key"] = api_key
+    if tool and "tool" not in qs:
+        qs["tool"] = tool
+    if email and "email" not in qs:
+        qs["email"] = email
+
+    return urlunparse(parsed._replace(query=urlencode(qs)))
 
 # Retryable HTTP status codes: rate limiting + transient upstream failures
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -64,6 +198,8 @@ def _request_with_retry(url, headers=None, timeout=30):
     NOT retried and propagate unchanged.
     """
     max_retries, backoff_base, backoff_max = _get_retry_config()
+    # Append api_key / tool / email for NCBI E-utilities calls (no-op for others).
+    url = _inject_credentials(url)
     last_exc = None
 
     for attempt in range(max_retries + 1):
@@ -140,10 +276,13 @@ def search_pubmed(search_url):
     response = _request_with_retry(search_url)
     
     if response.status_code == 200:
-        root = ET.fromstring(response.content)
+        root = _parse_xml(response.content)
+        if root is None:
+            logger.error("Unable to parse esearch XML response.")
+            return []
         id_list = root.find("IdList")
         if id_list is not None:
-            return [id.text for id in id_list.findall("Id")]
+            return [pmid_elem.text for pmid_elem in id_list.findall("Id") if pmid_elem.text]
         else:
             logger.info("No results found.")
             return []
@@ -157,14 +296,28 @@ def get_pubmed_metadata(pmid):
     response = _request_with_retry(url)
     
     if response.status_code == 200:
-        root = ET.fromstring(response.content)
+        root = _parse_xml(response.content)
+        if root is None:
+            logger.error(f"Unable to parse efetch XML for PMID: {pmid}")
+            return None
         article = root.find(".//Article")
         if article is not None:
-            title = article.find(".//ArticleTitle")
-            title = title.text if title is not None else "No title available"
-            
-            abstract = article.find(".//Abstract/AbstractText")
-            abstract = abstract.text if abstract is not None else "No abstract available"
+            # Use itertext() to capture full title text including any sub-element content
+            title_elem = article.find(".//ArticleTitle")
+            title = ''.join(title_elem.itertext()).strip() if title_elem is not None else "No title available"
+
+            # Support structured abstracts: multiple <AbstractText Label="..."> sections
+            abstract_texts = article.findall(".//Abstract/AbstractText")
+            if abstract_texts:
+                parts = []
+                for at in abstract_texts:
+                    label = at.get("Label")
+                    text = ''.join(at.itertext()).strip()
+                    if text:
+                        parts.append(f"{label}: {text}" if label else text)
+                abstract = " ".join(parts) if parts else "No abstract available"
+            else:
+                abstract = "No abstract available"
             
             authors = []
             for author in article.findall(".//Author"):
@@ -209,7 +362,10 @@ def download_full_text_pdf(pmid):
         logger.error(f"Error: Unable to fetch article data (status code: {response.status_code})")
         return f"Error: Unable to fetch article data (status code: {response.status_code})"
     
-    root = ET.fromstring(response.content)
+    root = _parse_xml(response.content)
+    if root is None:
+        logger.error(f"Unable to parse efetch XML for PMID: {pmid}")
+        return f"Error: Unable to parse article data for PMID: {pmid}"
     pmc_id = root.find(".//ArticleId[@IdType='pmc']")
     
     if pmc_id is None:
