@@ -187,12 +187,35 @@ def _compute_delay(attempt, backoff_base, backoff_max, retry_after=None):
     return delay + jitter
 
 
-def _request_with_retry(url, headers=None, timeout=30):
+def _is_unexpected_html(response) -> bool:
+    """Return True when an XML-expecting endpoint responds with an HTML body.
+
+    NCBI E-utilities occasionally returns HTTP 200 with a small HTML
+    error/throttle page (~3.8KB) instead of the expected XML payload, even
+    when ``retmode=xml`` is set. The lenient BeautifulSoup fallback in
+    ``_parse_xml`` would otherwise parse such pages "successfully", yielding
+    a tree with a ``<html>`` root and no ``<PubmedArticleSet>``/``<eSearchResult>``
+    nodes. Detecting this at the request layer lets us treat it as a
+    transient failure and trigger a retry.
+    """
+    ctype = (response.headers.get("Content-Type") or "").lower()
+    if "xml" in ctype:
+        return False
+    if "html" in ctype:
+        return True
+    # Content-Type missing or non-standard: peek at body
+    head = response.content[:200].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def _request_with_retry(url, headers=None, timeout=30, expect_xml=False):
     """GET request wrapper with exponential-backoff retries.
 
     Retry conditions:
       1. HTTP status code in _RETRYABLE_STATUS_CODES (429/500/502/503/504)
       2. Network exception ConnectionError / Timeout
+      3. ``expect_xml=True`` and the 2xx response body is HTML rather than XML
+         (NCBI sometimes serves HTML throttle/error pages with status 200)
 
     Other status codes (e.g. 4xx client errors) and other exceptions are
     NOT retried and propagate unchanged.
@@ -205,13 +228,24 @@ def _request_with_retry(url, headers=None, timeout=30):
     for attempt in range(max_retries + 1):
         try:
             response = requests.get(url, headers=headers, timeout=timeout)
-            if response.status_code not in _RETRYABLE_STATUS_CODES:
+            retryable_status = response.status_code in _RETRYABLE_STATUS_CODES
+            html_when_xml_expected = (
+                expect_xml
+                and 200 <= response.status_code < 300
+                and _is_unexpected_html(response)
+            )
+            if not retryable_status and not html_when_xml_expected:
                 return response
-            # Hit a retryable status code
+            # Hit a retryable condition
+            reason = (
+                f"status={response.status_code}"
+                if retryable_status
+                else f"unexpected HTML response (status={response.status_code}, len={len(response.content)})"
+            )
             if attempt >= max_retries:
                 logger.warning(
                     f"PubMed request gave up after {max_retries} retries, "
-                    f"last status={response.status_code}, url={url}"
+                    f"last {reason}, url={url}"
                 )
                 return response
             delay = _compute_delay(
@@ -219,7 +253,7 @@ def _request_with_retry(url, headers=None, timeout=30):
                 retry_after=response.headers.get("Retry-After"),
             )
             logger.info(
-                f"PubMed status {response.status_code}, "
+                f"PubMed {reason}, "
                 f"retry {attempt + 1}/{max_retries} in {delay:.2f}s: {url}"
             )
             time.sleep(delay)
@@ -273,7 +307,7 @@ def generate_pubmed_search_url(term=None, title=None, author=None, journal=None,
 
 def search_pubmed(search_url):
     """从 PubMed 搜索结果中解析文章 ID"""
-    response = _request_with_retry(search_url)
+    response = _request_with_retry(search_url, expect_xml=True)
     
     if response.status_code == 200:
         root = _parse_xml(response.content)
@@ -293,7 +327,7 @@ def search_pubmed(search_url):
 def get_pubmed_metadata(pmid):
     """使用 PubMed API 通过 PMID 获取文章的详细元数据"""
     url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
-    response = _request_with_retry(url)
+    response = _request_with_retry(url, expect_xml=True)
     
     if response.status_code == 200:
         root = _parse_xml(response.content)
@@ -356,7 +390,7 @@ def download_full_text_pdf(pmid):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-    response = _request_with_retry(efetch_url, headers=headers)
+    response = _request_with_retry(efetch_url, headers=headers, expect_xml=True)
     
     if response.status_code != 200:
         logger.error(f"Error: Unable to fetch article data (status code: {response.status_code})")
