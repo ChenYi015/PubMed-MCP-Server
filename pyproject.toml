@@ -10,3 +10,6 @@ dependencies = [
     "beautifulsoup4>=4.9.3",
     "asyncio>=3.4.3",
 ]
+
+[tool.setuptools]
+py-modules = ["pubmed_server", "pubmed_web_search"]
