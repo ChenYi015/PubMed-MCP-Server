@@ -1,9 +1,112 @@
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import os
+import time
+import random
+import logging
 from collections import Counter
 import re
 import requests
+
+logger = logging.getLogger(__name__)
+
+# Retryable HTTP status codes: rate limiting + transient upstream failures
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# Retryable network exceptions
+_RETRYABLE_EXCEPTIONS = (requests.ConnectionError, requests.Timeout)
+
+
+def _get_retry_config():
+    """Read retry configuration from environment variables.
+
+    Supported environment variables:
+      - PUBMED_MAX_RETRIES: max retry attempts (default 3, excluding the first request)
+      - PUBMED_RETRY_BACKOFF: exponential backoff base in seconds (default 1.0)
+      - PUBMED_RETRY_BACKOFF_MAX: max backoff per attempt in seconds (default 30.0)
+    """
+    def _read(name, default, caster):
+        raw = os.getenv(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return caster(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid value for {name}={raw!r}, fallback to {default}")
+            return default
+
+    max_retries = max(0, _read("PUBMED_MAX_RETRIES", 3, int))
+    backoff_base = max(0.0, _read("PUBMED_RETRY_BACKOFF", 1.0, float))
+    backoff_max = max(0.0, _read("PUBMED_RETRY_BACKOFF_MAX", 30.0, float))
+    return max_retries, backoff_base, backoff_max
+
+
+def _compute_delay(attempt, backoff_base, backoff_max, retry_after=None):
+    """Compute the wait time before the next retry (exponential backoff + jitter, honoring Retry-After)."""
+    if retry_after is not None:
+        try:
+            return min(float(retry_after), backoff_max)
+        except (TypeError, ValueError):
+            pass
+    delay = min(backoff_base * (2 ** attempt), backoff_max)
+    # Jitter prevents thundering herd when multiple clients retry in sync
+    jitter = random.uniform(0, backoff_base) if backoff_base > 0 else 0.0
+    return delay + jitter
+
+
+def _request_with_retry(url, headers=None, timeout=30):
+    """GET request wrapper with exponential-backoff retries.
+
+    Retry conditions:
+      1. HTTP status code in _RETRYABLE_STATUS_CODES (429/500/502/503/504)
+      2. Network exception ConnectionError / Timeout
+
+    Other status codes (e.g. 4xx client errors) and other exceptions are
+    NOT retried and propagate unchanged.
+    """
+    max_retries, backoff_base, backoff_max = _get_retry_config()
+    last_exc = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            if response.status_code not in _RETRYABLE_STATUS_CODES:
+                return response
+            # Hit a retryable status code
+            if attempt >= max_retries:
+                logger.warning(
+                    f"PubMed request gave up after {max_retries} retries, "
+                    f"last status={response.status_code}, url={url}"
+                )
+                return response
+            delay = _compute_delay(
+                attempt, backoff_base, backoff_max,
+                retry_after=response.headers.get("Retry-After"),
+            )
+            logger.info(
+                f"PubMed status {response.status_code}, "
+                f"retry {attempt + 1}/{max_retries} in {delay:.2f}s: {url}"
+            )
+            time.sleep(delay)
+        except _RETRYABLE_EXCEPTIONS as exc:
+            last_exc = exc
+            if attempt >= max_retries:
+                logger.warning(
+                    f"PubMed request gave up after {max_retries} retries, "
+                    f"last error={type(exc).__name__}: {exc}, url={url}"
+                )
+                raise
+            delay = _compute_delay(attempt, backoff_base, backoff_max)
+            logger.info(
+                f"PubMed raised {type(exc).__name__}, "
+                f"retry {attempt + 1}/{max_retries} in {delay:.2f}s: {url}"
+            )
+            time.sleep(delay)
+
+    # Unreachable in theory: the loop either returns or raises
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("_request_with_retry exited unexpectedly")
+
 
 def generate_pubmed_search_url(term=None, title=None, author=None, journal=None, 
                                start_date=None, end_date=None, num_results=10):
@@ -34,7 +137,7 @@ def generate_pubmed_search_url(term=None, title=None, author=None, journal=None,
 
 def search_pubmed(search_url):
     """从 PubMed 搜索结果中解析文章 ID"""
-    response = requests.get(search_url)
+    response = _request_with_retry(search_url)
     
     if response.status_code == 200:
         root = ET.fromstring(response.content)
@@ -51,7 +154,7 @@ def search_pubmed(search_url):
 def get_pubmed_metadata(pmid):
     """使用 PubMed API 通过 PMID 获取文章的详细元数据"""
     url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
-    response = requests.get(url)
+    response = _request_with_retry(url)
     
     if response.status_code == 200:
         root = ET.fromstring(response.content)
@@ -100,7 +203,7 @@ def download_full_text_pdf(pmid):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-    response = requests.get(efetch_url, headers=headers)
+    response = _request_with_retry(efetch_url, headers=headers)
     
     if response.status_code != 200:
         logger.error(f"Error: Unable to fetch article data (status code: {response.status_code})")
@@ -119,7 +222,7 @@ def download_full_text_pdf(pmid):
     
     # 检查文章是否为开放访问
     pmc_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/"
-    pmc_response = requests.get(pmc_url, headers=headers)
+    pmc_response = _request_with_retry(pmc_url, headers=headers)
     
     if pmc_response.status_code != 200:
         logger.error(f"Error: Unable to access PMC article page (status code: {pmc_response.status_code})")
@@ -133,7 +236,7 @@ def download_full_text_pdf(pmid):
     
     # 尝试下载PDF
     pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/pdf"
-    pdf_response = requests.get(pdf_url, headers=headers)
+    pdf_response = _request_with_retry(pdf_url, headers=headers)
     
     if pdf_response.status_code != 200:
         logger.error(f"Error: Unable to download PDF (status code: {pdf_response.status_code})")
